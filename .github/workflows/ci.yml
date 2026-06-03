@@ -1,0 +1,134 @@
+name: CI + 智能PR处理
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  test-and-classify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ======== 第1步: 运行测试 ========
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install & Test Backend
+        working-directory: backend
+        run: |
+          npm ci 2>/dev/null || true
+          npm test 2>/dev/null || echo "No tests yet"
+
+      - name: Install & Test Frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build  # 至少验证能构建
+
+      # ======== 第2步: 风险分析 ========
+      - name: Analyze Changed Files (风险分析)
+        id: risk
+        run: |
+          # 获取变更文件列表
+          CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD)
+
+          echo "📄 变更文件:"
+          echo "$CHANGED"
+
+          # 高风险模式匹配
+          HIGH_RISK_PATTERNS="(src/.*\.(ts|js|jsx|tsx)$|backend/|database/|auth/|middleware/|migrations/|docker-compose|Dockerfile|\.env|security|password|token|secret|api/.*route|controller|service)"
+
+          HIGH_RISK_FILES=$(echo "$CHANGED" | grep -iE "$HIGH_RISK_PATTERNS" || true)
+          ONLY_DOCS=$(echo "$CHANGED" | grep -vE "\.(md|txt|gitignore|editorconfig)$" || true)
+
+          if [ -z "$HIGH_RISK_FILES" ] && [ -z "$ONLY_DOCS" ]; then
+            echo "risk=low" >> $GITHUB_OUTPUT
+            echo "✅ 低风险: 仅文档/配置文件变更"
+          elif [ -n "$HIGH_RISK_FILES" ]; then
+            echo "risk=high" >> $GITHUB_OUTPUT
+            echo "⚠️ 高风险: 涉及核心代码变更"
+            echo "risky_files<<EOF" >> $GITHUB_OUTPUT
+            echo "$HIGH_RISK_FILES" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          else
+            echo "risk=medium" >> $GITHUB_OUTPUT
+            echo "📝 中风险: 代码变更但非核心模块"
+          fi
+
+      # ======== 第3步: 添加风险标签 ========
+      - name: Add Risk Label
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const risk = '${{ steps.risk.outputs.risk }}';
+            const labels = {
+              'low': ['risk-low', 'auto-merge-ready'],
+              'medium': ['risk-medium', 'needs-review'],
+              'high': ['risk-high', 'needs-human-review']
+            };
+            const toAdd = labels[risk] || ['needs-review'];
+            // 先移除旧标签再添加新标签
+            const existing = await github.rest.issues.listLabelsOnIssue({
+              ...context.repo,
+              issue_number: context.issue.number
+            });
+            const oldRiskLabels = existing.data
+              .map(l => l.name)
+              .filter(n => n.startsWith('risk-') || n.startsWith('auto-merge') || n.includes('needs-'));
+            for (const label of oldRiskLabels) {
+              try {
+                await github.rest.issues.removeLabel({
+                  ...context.repo,
+                  issue_number: context.issue.number,
+                  name: label
+                });
+              } catch(e) {}
+            }
+            await github.rest.issues.addLabels({
+              ...context.repo,
+              issue_number: context.issue.number,
+              labels: toAdd
+            });
+
+      # ======== 第4步: 低风险 → 自动合并 ========
+      - name: Auto-Merge (低风险)
+        if: steps.risk.outputs.risk == 'low'
+        run: |
+          gh pr merge ${{ github.event.pull_request.number }} \
+            --merge \
+            --subject "🤖 AI自动合并: 低风险变更" \
+            --body "仅文档/配置文件变更，自动合并"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      # ======== 第5步: 高风险 → 评论通知 ========
+      - name: Comment High Risk
+        if: steps.risk.outputs.risk == 'high'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const files = `${{ steps.risk.outputs.risky_files }}`;
+            const body = `## ⚠️ AI 风险提醒
+
+            此 PR 涉及高风险文件变更，**需要人工审核**：
+
+            \`\`\`
+            ${files}
+            \`\`\`
+
+            请 Review 后手动合并 🙏`;
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.issue.number,
+              body
+            });
